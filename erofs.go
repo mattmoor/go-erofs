@@ -990,7 +990,14 @@ func (b *file) readInfo() (ino *inode, err error) {
 	}()
 
 	buf := blk.bytes()
-	_, err = b.img.meta.ReadAt(buf, addr)
+	n, err := b.img.meta.ReadAt(buf, addr)
+	// An inode near the end of a block is read with a buffer sized for an
+	// extended inode, so a compact inode at the very end of the image leaves
+	// the read short. Keep what was read; the format below decides whether
+	// it covers the inode.
+	if errors.Is(err, io.EOF) && n >= disk.SizeInodeCompact {
+		buf, err = buf[:n], nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1023,6 +1030,9 @@ func (b *file) readInfo() (ino *inode, err error) {
 		}
 		xcnt = di.XattrCount
 	} else {
+		if len(buf) < disk.SizeInodeExtended {
+			return nil, io.ErrUnexpectedEOF
+		}
 		var di disk.InodeExtended
 		if _, err = binary.Decode(buf[:disk.SizeInodeExtended], binary.LittleEndian, &di); err != nil {
 			return nil, err

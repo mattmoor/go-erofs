@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -343,5 +344,71 @@ func TestDataRangeSparseChunkBased(t *testing.T) {
 
 	if !foundHole {
 		t.Error("no hole entries found in fixture — buildChunkDataRanges hole path was not exercised")
+	}
+}
+
+// TestReadTrailingCompactInode reads images whose last inode is compact and
+// starts within the final SizeInodeExtended bytes of the image. An inode near
+// a block's end is read with a buffer sized for an extended inode, so for a
+// compact inode at the very end of the image that read ran past EOF. The
+// image is a composefs-style git directory: inline files, holes carrying
+// overlay xattrs, and an empty "refs" directory whose inode sorts last. For
+// some counts of holes that inode lands in the image's final bytes.
+func TestReadTrailingCompactInode(t *testing.T) {
+	build := time.Date(2026, 9, 27, 22, 0, 0, 0, time.UTC)
+	// With these hole sizes, 32 pairs of holes put the "refs" inode in the
+	// final bytes of the image; its neighbors do not.
+	for _, n := range []int{31, 32, 33} {
+		var buf testBuffer
+		fsys := erofs.Create(&buf, erofs.WithBuildTime(uint64(build.Unix()), 0))
+		must := func(err error) {
+			t.Helper()
+			if err != nil {
+				t.Fatalf("holes=%d: %v", n, err)
+			}
+		}
+		inline := func(name, data string) {
+			f, err := fsys.Create(name)
+			must(err)
+			_, err = f.Write([]byte(data))
+			must(err)
+			must(f.Close())
+		}
+		hole := func(name string, i int, mtime time.Time) {
+			must(fsys.CreateHole(name, 123456789))
+			must(fsys.Setxattr(name, "trusted.overlay.redirect", fmt.Sprintf("/%02x/%062x", i%256, i)))
+			must(fsys.Setxattr(name, "trusted.overlay.metacopy", ""))
+			must(fsys.Setxattr(name, "user.digest", fmt.Sprintf("fsverity:%064x", i)))
+			must(fsys.Chtimes(name, time.Time{}, mtime))
+		}
+		inline("/HEAD", strings.Repeat("a", 40)+"\n")
+		inline("/config", "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = \"https://example.com/repo\"\n")
+		hole("/index", 1<<20, build.Add(-time.Second))
+		for _, dir := range []string{"/objects", "/objects/pack", "/refs"} {
+			must(fsys.Mkdir(dir, 0o755))
+			must(fsys.Chtimes(dir, time.Time{}, build))
+		}
+		for i := range n {
+			hole(fmt.Sprintf("/objects/pack/pack-%04d.pack", i), 2*i, build)
+			hole(fmt.Sprintf("/objects/pack/pack-%04d.idx", i), 2*i+1, build)
+		}
+		must(fsys.Close())
+
+		efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("holes=%d: Open: %v", n, err)
+		}
+		err = fs.WalkDir(efs, ".", func(p string, _ fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if _, err := fs.Stat(efs, p); err != nil {
+				return fmt.Errorf("stat %q: %w", p, err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("pack pairs=%d (image %d bytes): walk: %v", n, len(buf.Bytes()), err)
+		}
 	}
 }
